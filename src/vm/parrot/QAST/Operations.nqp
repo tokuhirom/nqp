@@ -1527,7 +1527,6 @@ QAST::Operations.add_core_op('control', -> $qastcomp, $op {
         my $ops := PIRT::Ops.new(:result('0'));
         
         if $label {
-            #~ $label.value."$name"(1);
             my $l  := $qastcomp.coerce($qastcomp.as_post($label), 'P');
             my $ex := $*REGALLOC.fresh_p();
             $ops.push($l);
