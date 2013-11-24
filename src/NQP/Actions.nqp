@@ -290,7 +290,10 @@ class NQP::Actions is HLL::Actions {
     method statement_control:sym<while>($/) {
         my $past := xblock_immediate( $<xblock>.ast );
         $past.op(~$<sym>);
-        unless $*CONTROL_USED {
+        if $*LABEL {
+            $past.push(QAST::WVal.new( :value($*W.find_sym([$*LABEL])), :named('label') ));
+        }
+        elsif !$*CONTROL_USED {
             $past.push(QAST::IVal.new( :value(1), :named('nohandler') ));
         }
         make $past;
@@ -1574,9 +1577,33 @@ class NQP::Actions is HLL::Actions {
         );
     }
     
-    method term:sym<next>($/) { make QAST::Op.new( :op('control'), :name('next') ) }
-    method term:sym<last>($/) { make QAST::Op.new( :op('control'), :name('last') ) }
-    method term:sym<redo>($/) { make QAST::Op.new( :op('control'), :name('redo') ) }
+    method term:sym<next>($/) {
+        my $ast := QAST::Op.new( :op('control'), :name('next') );
+        
+        if $<identifier> {
+            $ast.push(QAST::WVal.new( :value($*W.find_sym([$<identifier>])), :named('label') ));
+        }
+        
+        make $ast
+    }
+    method term:sym<last>($/) {
+        my $ast := QAST::Op.new( :op('control'), :name('last') );
+        
+        if $<identifier> {
+            $ast.push(QAST::WVal.new( :value($*W.find_sym([$<identifier>])), :named('label') ));
+        }
+        
+        make $ast
+    }
+    method term:sym<redo>($/) {
+        my $ast := QAST::Op.new( :op('control'), :name('redo') );
+        
+        if $<identifier> {
+            $ast.push(QAST::WVal.new( :value($*W.find_sym([$<identifier>])), :named('label') ));
+        }
+        
+        make $ast
+    }
 
     method infix:sym<~~>($/) {
         make QAST::Op.new( :op<callmethod>, :name<ACCEPTS>, :node($/) );
