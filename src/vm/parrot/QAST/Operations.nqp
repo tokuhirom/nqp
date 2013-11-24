@@ -690,8 +690,10 @@ for ('', 'repeat_') -> $repness {
 QAST::Operations.add_core_op('for', :inlinable(1), -> $qastcomp, $op {
     my $handler := 1;
     my @operands;
+    my $label;
     for $op.list {
         if $_.named eq 'nohandler' { $handler := 0; }
+        elsif $_.named eq 'label' { $label := $_ }
         else { @operands.push($_) }
     }
 
@@ -728,7 +730,9 @@ QAST::Operations.add_core_op('for', :inlinable(1), -> $qastcomp, $op {
         $exc_reg  := $*REGALLOC.fresh_p();
         $hand_lbl := PIRT::Label.new(:name('for_handlers'));
         $ops.push_pirop('new', $exc_reg, "'ExceptionHandler'",
-            '[.CONTROL_LOOP_NEXT;.CONTROL_LOOP_REDO;.CONTROL_LOOP_LAST]');
+            $label  ?? '[.CONTROL_LOOP_NEXT;.CONTROL_LOOP_REDO;.CONTROL_LOOP_LAST;512;513;514]'
+                    !! '[.CONTROL_LOOP_NEXT;.CONTROL_LOOP_REDO;.CONTROL_LOOP_LAST]'
+        );
         $ops.push_pirop('set_label', $exc_reg, $hand_lbl);
         $ops.push_pirop('push_eh', $exc_reg);
     }
@@ -761,11 +765,31 @@ QAST::Operations.add_core_op('for', :inlinable(1), -> $qastcomp, $op {
     # Handlers.
     if $handler {
         $ops.push($hand_lbl);
+        my $type_reg := $*REGALLOC.fresh_p();
         $ops.push_pirop('.get_results', '(' ~ $exc_reg ~ ')');
         $ops.push_pirop('pop_upto_eh', $exc_reg);
-        $ops.push_pirop('getattribute', $exc_reg, $exc_reg, "'type'");
-        $ops.push_pirop('eq', $exc_reg, '.CONTROL_LOOP_NEXT', $lbl_next);
-        $ops.push_pirop('eq', $exc_reg, '.CONTROL_LOOP_REDO', $lbl_redo);
+        $ops.push_pirop('getattribute', $type_reg, $exc_reg, "'type'");
+        $ops.push_pirop('eq', $type_reg, '.CONTROL_LOOP_NEXT', $lbl_next);
+        $ops.push_pirop('eq', $type_reg, '.CONTROL_LOOP_REDO', $lbl_redo);
+
+        if $label {
+            my $l := $qastcomp.coerce($qastcomp.as_post($label), 'P');
+            my $pay_reg := $*REGALLOC.fresh_p();
+            my $id1_reg := $*REGALLOC.fresh_i();
+            my $id2_reg := $*REGALLOC.fresh_i();
+            my $rethrow_lbl := PIRT::Label.new(:name('for_rethrow'));
+            $ops.push($l);
+            $ops.push_pirop('getattribute', $pay_reg, $exc_reg, "'payload'");
+            $ops.push_pirop('get_id', $id1_reg, $pay_reg);
+            $ops.push_pirop('get_id', $id2_reg, $l);
+            $ops.push_pirop('ne', $id1_reg, $id2_reg, $rethrow_lbl);
+            $ops.push_pirop('eq', $type_reg, 512, $lbl_next);
+            $ops.push_pirop('eq', $type_reg, 513, $lbl_redo);
+            $ops.push_pirop('eq', $type_reg, 514, $lbl_done);
+            $ops.push($rethrow_lbl);
+            $ops.push_pirop('rethrow', $exc_reg);
+        }
+
         $ops.push($lbl_done);
         $ops.push_pirop('pop_eh');
     }

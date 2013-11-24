@@ -310,7 +310,10 @@ class NQP::Actions is HLL::Actions {
             $past := QAST::Op.new( $<EXPR>.ast, block_immediate( $<pblock>.ast ),
                                    :op($op), :node($/) );
         }
-        unless $*CONTROL_USED {
+        if $*LABEL {
+            $past.push(QAST::WVal.new( :value($*W.find_sym([$*LABEL])), :named('label') ));
+        }
+        elsif !$*CONTROL_USED {
             $past.push(QAST::IVal.new( :value(1), :named('nohandler') ));
         }
         make $past;
@@ -326,7 +329,10 @@ class NQP::Actions is HLL::Actions {
             $block.arity(1);
         }
         $block.blocktype('immediate');
-        unless $*CONTROL_USED {
+        if $*LABEL {
+            $past.push(QAST::WVal.new( :value($*W.find_sym([$*LABEL])), :named('label') ));
+        }
+        elsif !$*CONTROL_USED {
             $past.push(QAST::IVal.new( :value(1), :named('nohandler') ));
         }
         make $past;
