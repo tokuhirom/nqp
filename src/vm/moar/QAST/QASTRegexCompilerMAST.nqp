@@ -147,8 +147,8 @@ class QAST::MASTRegexCompiler {
             op('gt_i', $i0, $i0, $zero),
             op('unless_i', $i0, $donelabel),
             op('pop_i', $i19, $bstack),
-            op('isnull', $i0, $cstack),
-            op('if_i', $i0, $cstacklabel),
+            op('islist', $i0, $cstack),
+            op('unless_i', $i0, $cstacklabel),
             op('elems', $i0, $cstack),
             op('gt_i', $i0, $i0, $zero),
             op('unless_i', $i0, $cstacklabel),
@@ -167,6 +167,7 @@ class QAST::MASTRegexCompiler {
             # backtrack the cursor stack
             op('isnull', $i0, $cstack),
             op('if_i', $i0, $jumplabel),
+            op('unless_o', $cstack, $jumplabel),
             op('elems', $i18, $bstack),
             op('le_i', $i0, $i18, $zero),
             op('if_i', $i0, $cutlabel),
@@ -339,6 +340,8 @@ class QAST::MASTRegexCompiler {
         }
         elsif $subtype eq 'pass' || $subtype eq '' {
             # Nothing to do.
+        } elsif $subtype eq 'zerowidth' {
+            # Nothing to do either. This gets generated for <???>, for example
         }
         else {
             nqp::die("Unknown anchor subtype $subtype");
@@ -945,6 +948,50 @@ class QAST::MASTRegexCompiler {
         }
         my $rxtype := $node.rxtype() || 'concat';
         self."$rxtype"($node) # expects to return an nqp::list of instructions
+    }
+
+    method uniprop($node) {
+        my $pname := fresh_s();
+        my $pcode := fresh_i();
+        my $pvcode := fresh_i();
+        my $pprop := fresh_s();
+        my $i0 := fresh_i();
+        my $testop := $node.negate ?? 'if_i' !! 'unless_i';
+        my $prefix := $*QASTCOMPILER.unique($*RXPREFIX ~ '_uniprop');
+        my $hasvalcode := label($prefix ~ '_haselems');
+        my $endblock   := label($prefix ~ '_endblock');
+        my $succeed    := label($prefix ~ '_succeed');
+        my @ins := [
+            op('ge_i', $i0, %*REG<pos>, %*REG<eos>),
+            op('if_i', $i0, %*REG<fail>),
+        ];
+        if ~$node[0] ~~ /^ [ In<[A..Z]> | in<[a..z]> ]/ { # "InArabic" is a lookup of Block Arabic
+            merge_ins(@ins, [
+                op('const_s', $pname, sval(nqp::substr($node[0],2))),
+                op('uniisblock', $i0, %*REG<tgt>, %*REG<pos>, $pname),
+                op('if_i', $i0, $succeed),
+                
+                op('const_s', $pprop, sval('Block')),
+                op('const_s', $pname, sval(nqp::substr($node[0],2))),
+                op('unipropcode', $pcode, $pprop),
+                op('unless_i', $pcode, $endblock),
+                op('unipvalcode', $pvcode, $pcode, $pname),
+                op('if_i', $pvcode, $hasvalcode),
+                $endblock,
+            ]);
+        }
+        merge_ins(@ins, [
+            op('const_s', $pname, sval($node[0])),
+            op('unipropcode', $pcode, $pname),
+            op('unipvalcode', $pvcode, $pcode, $pname),
+            #~ op($testop, $pvcode, %*REG<fail>), # XXX I am sure we should fail here
+            $hasvalcode,
+            op('hasuniprop', $i0, %*REG<tgt>, %*REG<pos>, $pcode, $pvcode),
+            $succeed,
+            op($testop, $i0, %*REG<fail>),
+            op('inc_i', %*REG<pos>)
+        ]);
+        @ins
     }
 
     method ws($node) { self.subrule($node) }

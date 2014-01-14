@@ -430,8 +430,6 @@ public final class Ops {
                 cs = Charset.forName("UTF-8");
             else if (encoding.equals("utf16"))
                 cs = Charset.forName("UTF-16");
-            else if (encoding.equals("binary"))
-                cs = Charset.forName("ISO-8859-1"); /* Byte oriented... */
             else
                 throw ExceptionHandling.dieInternal(tc,
                     "Unsupported encoding " + encoding);
@@ -517,14 +515,15 @@ public final class Ops {
         }
     }
     
-    public static SixModelObject writefh(SixModelObject obj, SixModelObject buf, ThreadContext tc) {
+    public static long writefh(SixModelObject obj, SixModelObject buf, ThreadContext tc) {
         ByteBuffer bb = decode8(buf, tc);
+        long written;
         if (obj instanceof IOHandleInstance) {
             IOHandleInstance h = (IOHandleInstance)obj;
             byte[] bytesToWrite = new byte[bb.limit()];
             bb.get(bytesToWrite);
             if (h.handle instanceof IIOSyncWritable)
-                ((IIOSyncWritable)h.handle).write(tc, bytesToWrite);
+                written = ((IIOSyncWritable)h.handle).write(tc, bytesToWrite);
             else
                 throw ExceptionHandling.dieInternal(tc,
                     "This handle does not support write");
@@ -533,14 +532,15 @@ public final class Ops {
             throw ExceptionHandling.dieInternal(tc,
                 "writefh requires an object with the IOHandle REPR");
         }
-        return buf;
+        return written;
     }
     
-    public static String printfh(SixModelObject obj, String data, ThreadContext tc) {
+    public static long printfh(SixModelObject obj, String data, ThreadContext tc) {
+        long written;
         if (obj instanceof IOHandleInstance) {
             IOHandleInstance h = (IOHandleInstance)obj;
             if (h.handle instanceof IIOSyncWritable)
-                ((IIOSyncWritable)h.handle).print(tc, data);
+                written = ((IIOSyncWritable)h.handle).print(tc, data);
             else
                 throw ExceptionHandling.dieInternal(tc,
                     "This handle does not support print");
@@ -549,14 +549,15 @@ public final class Ops {
             throw ExceptionHandling.dieInternal(tc,
                 "printfh requires an object with the IOHandle REPR");
         }
-        return data;
+        return written;
     }
     
-    public static String sayfh(SixModelObject obj, String data, ThreadContext tc) {
+    public static long sayfh(SixModelObject obj, String data, ThreadContext tc) {
+        long written;
         if (obj instanceof IOHandleInstance) {
             IOHandleInstance h = (IOHandleInstance)obj;
             if (h.handle instanceof IIOSyncWritable)
-                ((IIOSyncWritable)h.handle).say(tc, data);
+                written = ((IIOSyncWritable)h.handle).say(tc, data);
             else
                 throw ExceptionHandling.dieInternal(tc,
                     "This handle does not support say");
@@ -565,7 +566,7 @@ public final class Ops {
             throw ExceptionHandling.dieInternal(tc,
                 "sayfh requires an object with the IOHandle REPR");
         }
-        return data;
+        return written;
     }
     
     public static SixModelObject flushfh(SixModelObject obj, ThreadContext tc) {
@@ -1909,8 +1910,7 @@ public final class Ops {
         }
         
         try {
-            // Do the invocation.
-            cr.staticInfo.mh.invokeExact(tc, cr, csd, args);
+            ArgsExpectation.invokeByExpectation(tc, cr, csd, args);
         }
         catch (ControlException e) {
             if (barrier && (e instanceof SaveStackException))

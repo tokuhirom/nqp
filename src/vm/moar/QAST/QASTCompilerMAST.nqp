@@ -230,11 +230,16 @@ class QAST::MASTCompiler {
             nqp::push(@!captured_inners, $block.cuid)
         }
         method clone_inner($block) {
-            my $reg  := $*REGALLOC.fresh_register($MVM_reg_obj, 1);
             my $cuid := $block.cuid;
-            %!cloned_inners{$cuid} := $reg;
-            %!local_names_by_index{$reg.index} := $cuid;
-            $reg
+            if %!cloned_inners{$cuid} -> $already {
+                $already
+            }
+            else {
+                my $reg  := $*REGALLOC.fresh_register($MVM_reg_obj, 1);
+                %!cloned_inners{$cuid} := $reg;
+                %!local_names_by_index{$reg.index} := $cuid;
+                $reg
+            }
         }
         method captured_inners() { @!captured_inners }
         method cloned_inners() { %!cloned_inners }
@@ -253,7 +258,7 @@ class QAST::MASTCompiler {
         $source;
     }
 
-    our $serno := 0;
+    my $serno := 0;
     method unique($prefix = '') { $prefix ~ $serno++ }
 
     method to_mast($qast) {
@@ -372,7 +377,7 @@ class QAST::MASTCompiler {
         }
     }
 
-    my %want_char := nqp::hash($MVM_reg_int64, 'I', $MVM_reg_num64, 'N', $MVM_reg_str, 'S');
+    my %want_char := nqp::hash($MVM_reg_int64, 'I', $MVM_reg_num64, 'N', $MVM_reg_str, 'S', $MVM_reg_void, 'v');
     sub want($node, $type) {
         my @possibles := nqp::clone($node.list);
         my $best := @possibles.shift;
@@ -458,6 +463,9 @@ class QAST::MASTCompiler {
         # are 0 = static lex, 1 = container, 2 = state container.
         my %*BLOCK_LEX_VALUES;
 
+        # Blocks we've seen while compiling.
+        my %*BLOCKS_DONE;
+
         # Compile the block; make sure $*BLOCK is clear.
         my $*BLOCK;
         self.as_mast($cu[0]);
@@ -529,7 +537,7 @@ class QAST::MASTCompiler {
     method deserialization_code($sc, @code_ref_blocks, $repo_conf_res) {
         # Serialize it.
         my $sh := nqp::list_s();
-        my $serialized := nqp::serialize($sc, $sh);
+        my str $serialized := nqp::serialize($sc, $sh);
 
         # Now it's serialized, pop this SC off the compiling SC stack.
         nqp::popcompsc();
@@ -578,7 +586,9 @@ class QAST::MASTCompiler {
             ),
             QAST::Op.new(
                 :op('deserialize'),
-                QAST::SVal.new( :value($serialized) ),
+                nqp::isnull_s($serialized)
+                    ?? QAST::Op.new( :op('null_s') )
+                    !! QAST::SVal.new( :value($serialized) ),
                 QAST::Var.new( :name('cur_sc'), :scope('local') ),
                 $sh_ast,
                 QAST::Block.new( :blocktype('immediate'), $cr_past ),
@@ -596,208 +606,222 @@ class QAST::MASTCompiler {
     }
 
     multi method as_mast(QAST::Block $node, :$want) {
-        my $outer_frame := try $*MAST_FRAME;
-
-        # Create an empty frame and add it to the compilation unit.
-        my $frame := MAST::Frame.new(
-            :name($node.name || self.unique('frame_name_')),
-            :cuuid($node.cuid));
-
-        $*MAST_COMPUNIT.add_frame($frame);
+        my $cuid := $node.cuid();
+        my $block;
         my $outer;
-        try $outer   := $*BLOCK;
-        my $block    := BlockInfo.new($node, (nqp::defined($outer) ?? $outer !! NQPMu), self);
-        my $cuid     := $node.cuid();
+        if %*BLOCKS_DONE{$cuid} -> @already {
+            $block := @already[0];
+            $outer := @already[1];
+        }
+        else {
+            my $outer_frame := try $*MAST_FRAME;
 
-        # stash the frame by the block's cuid so other references
-        # by this block can find it.
-        %*MAST_FRAMES{$cuid} := $frame;
+            # Create an empty frame and add it to the compilation unit.
+            my $frame := MAST::Frame.new(
+                :name($node.name),
+                :cuuid($cuid));
 
-        # set the outer if it exists
-        $frame.set_outer($outer_frame)
-            if $outer_frame && $outer_frame ~~ MAST::Frame;
+            $*MAST_COMPUNIT.add_frame($frame);
+            try $outer := $*BLOCK;
+            $block     := BlockInfo.new($node, (nqp::defined($outer) ?? $outer !! NQPMu), self);
+            %*BLOCKS_DONE{$cuid} := [$block, $outer];
 
-        # Compile all the substatements.
-        my $ins;
-        {
-            my $*BINDVAL := 0;
+            # stash the frame by the block's cuid so other references
+            # by this block can find it.
+            %*MAST_FRAMES{$cuid} := $frame;
 
-            # Create a register allocator for this frame.
-            my $*REGALLOC := RegAlloc.new($frame);
+            # set the outer if it exists
+            $frame.set_outer($outer_frame)
+                if $outer_frame && $outer_frame ~~ MAST::Frame;
 
-            # when we enter a QAST::Stmt, the contextual will be cloned, and the locals of
-            # newly declared QAST::Vars of local scope inside the Stmt will be stashed here,
-            # so they can be released at the end of the QAST::Stmt in which they were
-            # declared.  Inability to declare duplicate names is still enfoced, and types are
-            # still enforced.
-            my %*STMTTEMPS := nqp::hash();
-            my $*INSTMT := 0;
-
-            my $*BLOCK := $block;
-            my $*MAST_FRAME := $frame;
-
-            $ins := self.compile_all_the_stmts(@($node));
-
-            # Add to instructions list for this block.
-            nqp::splice($frame.instructions, $ins.instructions, +$frame.instructions, 0);
-
-            $block.return_kind($ins.result_kind);
-            # generate a return statement
-            # get the return op name
-            my $ret_op := @return_opnames[$ins.result_kind];
-            my @ret_args := nqp::list();
-
-            # provide the return arg register if needed
-            nqp::push(@ret_args, $ins.result_reg) unless $ret_op eq 'return';
-
-            # fixup the end of this frame's instruction list with the return
-            push_op($frame.instructions, $ret_op, |@ret_args);
-
-            # Build up the frame prologue. Start with lexical captures and clones.
-            my @pre := nqp::list();
-            my $capture_reg := $*REGALLOC.fresh_register($MVM_reg_obj);
-            for $block.captured_inners() {
-                push_op(@pre, 'getcode', $capture_reg, %*MAST_FRAMES{$_});
-                push_op(@pre, 'capturelex', $capture_reg);
-            }
-            $*REGALLOC.release_register($capture_reg, $MVM_reg_obj);
-            for $block.cloned_inners() {
-                my $frame := %*MAST_FRAMES{$_.key};
-                my $reg   := $_.value;
-                push_op(@pre, 'getcode', $reg, $frame);
-                push_op(@pre, 'takeclosure', $reg, $reg);
+            # Set exit handler flag if needed.
+            if $node.has_exit_handler {
+                $frame.has_exit_handler(1);
             }
 
-            if $node.custom_args {
-                # The block does the arg processing by itself, so we accept any number
-                # of args here.
-                push_op(@pre, 'checkarity',
-                    MAST::IVal.new( :size(16), :value(0)),
-                    MAST::IVal.new( :size(16), :value(-1)));
-            }
-            else {
-                # Analyze parameters to get count of required/optional and make sure
-                # all is in order.
-                my $param_index := 0;
-                my int $pos_required := 0;
-                my int $pos_optional := 0;
-                my int $pos_slurpy   := 0;
-                for $block.params {
-                    if $_.named {
-                        # Don't count.
+            # Compile all the substatements.
+            my $ins;
+            {
+                my $*BINDVAL := 0;
+
+                # Create a register allocator for this frame.
+                my $*REGALLOC := RegAlloc.new($frame);
+
+                # when we enter a QAST::Stmt, the contextual will be cloned, and the locals of
+                # newly declared QAST::Vars of local scope inside the Stmt will be stashed here,
+                # so they can be released at the end of the QAST::Stmt in which they were
+                # declared.  Inability to declare duplicate names is still enfoced, and types are
+                # still enforced.
+                my %*STMTTEMPS := nqp::hash();
+                my $*INSTMT := 0;
+
+                my $*BLOCK := $block;
+                my $*MAST_FRAME := $frame;
+
+                my $*WANT;
+                $ins := self.compile_all_the_stmts(@($node));
+
+                # Add to instructions list for this block.
+                nqp::splice($frame.instructions, $ins.instructions, +$frame.instructions, 0);
+
+                $block.return_kind($ins.result_kind);
+                # generate a return statement
+                # get the return op name
+                my $ret_op := @return_opnames[$ins.result_kind];
+                my @ret_args := nqp::list();
+
+                # provide the return arg register if needed
+                nqp::push(@ret_args, $ins.result_reg) unless $ret_op eq 'return';
+
+                # fixup the end of this frame's instruction list with the return
+                push_op($frame.instructions, $ret_op, |@ret_args);
+
+                # Build up the frame prologue. Start with lexical captures and clones.
+                my @pre := nqp::list();
+                my $capture_reg := $*REGALLOC.fresh_register($MVM_reg_obj);
+                for $block.captured_inners() {
+                    push_op(@pre, 'getcode', $capture_reg, %*MAST_FRAMES{$_});
+                    push_op(@pre, 'capturelex', $capture_reg);
+                }
+                $*REGALLOC.release_register($capture_reg, $MVM_reg_obj);
+                for $block.cloned_inners() {
+                    my $frame := %*MAST_FRAMES{$_.key};
+                    my $reg   := $_.value;
+                    push_op(@pre, 'getcode', $reg, $frame);
+                    push_op(@pre, 'takeclosure', $reg, $reg);
+                }
+
+                if $node.custom_args {
+                    # The block does the arg processing by itself, so we accept any number
+                    # of args here.
+                    push_op(@pre, 'checkarity',
+                        MAST::IVal.new( :size(16), :value(0)),
+                        MAST::IVal.new( :size(16), :value(-1)));
+                }
+                else {
+                    # Analyze parameters to get count of required/optional and make sure
+                    # all is in order.
+                    my $param_index := 0;
+                    my int $pos_required := 0;
+                    my int $pos_optional := 0;
+                    my int $pos_slurpy   := 0;
+                    for $block.params {
+                        if $_.named {
+                            # Don't count.
+                        }
+                        elsif $_.slurpy {
+                            if $pos_slurpy {
+                                nqp::die("Only one slurpy positional allowed");
+                            }
+                            $pos_slurpy := 1;
+                        }
+                        elsif $_.default {
+                            if $pos_slurpy {
+                                nqp::die("Optional positionals must come before all slurpy positionals");
+                            }
+                            $pos_optional++;
+                        }
+                        else {
+                            if $pos_optional {
+                                nqp::die("Required positionals must come before all optional positionals");
+                            }
+                            if $pos_slurpy {
+                                nqp::die("Required positionals must come before all slurpy positionals");
+                            }
+                            $pos_required++;
+                        }
                     }
-                    elsif $_.slurpy {
-                        if $pos_slurpy {
-                            nqp::die("Only one slurpy positional allowed");
+
+                    # check the arity
+                    push_op(@pre, 'checkarity',
+                        MAST::IVal.new( :size(16), :value($pos_required)),
+                        MAST::IVal.new( :size(16), :value($pos_slurpy ?? -1 !! $pos_required + $pos_optional)));
+
+                    # build up instructions to bind the params
+                    for $block.params -> $var {
+
+                        my $scope := $var.scope;
+                        nqp::die("Param scope must be 'local' or 'lexical'")
+                            if $scope ne 'lexical' && $scope ne 'local';
+
+                        my $param_kind := self.type_to_register_kind($var.returns);
+                        my $opslot := @kind_to_op_slot[$param_kind];
+
+                        my $opname_index := ($var.named ?? 8 !! 0) + ($var.default ?? 4 !! 0) + $opslot;
+                        my $opname := @param_opnames[$opname_index];
+
+                        # what will be put in the value register
+                        my $val;
+
+                        if $var.slurpy {
+                            if $var.named {
+                                $opname := "param_sn";
+                            }
+                            else {
+                                $opname := "param_sp";
+                            }
                         }
-                        $pos_slurpy := 1;
-                    }
-                    elsif $_.default {
-                        if $pos_slurpy {
-                            nqp::die("Optional positionals must come before all slurpy positionals");
+                        elsif $var.named {
+                            $val := MAST::SVal.new( :value($var.named) );
                         }
-                        $pos_optional++;
-                    }
-                    else {
-                        if $pos_optional {
-                            nqp::die("Required positionals must come before all optional positionals");
+                        else { # positional
+                            $val := MAST::IVal.new( :size(16), :value($param_index));
                         }
-                        if $pos_slurpy {
-                            nqp::die("Required positionals must come before all slurpy positionals");
+
+                        # the variable register
+                        my $valreg := $scope eq 'lexical'
+                            ?? $block.lexical_param($var.name)
+                            !! $block.local($var.name);
+
+                        # NQP->QAST always provides a default value for optional NQP params
+                        # even if no default initializer expression is provided.
+                        if $var.default {
+                            # generate end label to skip initialization code
+                            my $endlbl := MAST::Label.new( :name(self.unique('param') ~ '_end') );
+
+                            # generate default initialization code. Could also be
+                            # wrapped in another QAST::Block.
+                            my $default_mast := self.as_mast($var.default, :want($param_kind));
+
+                        #    nqp::die("default initialization result type doesn't match the param type")
+                        #        unless $default_mast.result_kind == $param_kind;
+
+                            # emit param grabbing op
+                            push_op(@pre, $opname, $valreg, $val, $endlbl);
+
+                            # emit default initialization code
+                            push_ilist(@pre, $default_mast);
+
+                            # put the initialization result in the variable register
+                            push_op(@pre, 'set', $valreg, $default_mast.result_reg);
+                            $*REGALLOC.release_register($default_mast.result_reg, $default_mast.result_kind);
+
+                            # end label to skip initialization code
+                            nqp::push(@pre, $endlbl);
                         }
-                        $pos_required++;
+                        elsif $var.slurpy {
+                            if $var.named {
+                                push_op(@pre, $opname, $valreg);
+                            }
+                            else {
+                                push_op(@pre, $opname, $valreg, MAST::IVal.new( :value($pos_required + $pos_optional) ));
+                            }
+                        }
+                        else {
+                            # emit param grabbing op
+                            push_op(@pre, $opname, $valreg, $val);
+                        }
+
+                        if $scope eq 'lexical' {
+                            # emit the op to bind the lexical to the result register
+                            push_op(@pre, 'bindlex', $block.lexical($var.name), $valreg);
+                        }
+                        $param_index++;
                     }
                 }
 
-                # check the arity
-                push_op(@pre, 'checkarity',
-                    MAST::IVal.new( :size(16), :value($pos_required)),
-                    MAST::IVal.new( :size(16), :value($pos_slurpy ?? -1 !! $pos_required + $pos_optional)));
-
-                # build up instructions to bind the params
-                for $block.params -> $var {
-
-                    my $scope := $var.scope;
-                    nqp::die("Param scope must be 'local' or 'lexical'")
-                        if $scope ne 'lexical' && $scope ne 'local';
-
-                    my $param_kind := self.type_to_register_kind($var.returns);
-                    my $opslot := @kind_to_op_slot[$param_kind];
-
-                    my $opname_index := ($var.named ?? 8 !! 0) + ($var.default ?? 4 !! 0) + $opslot;
-                    my $opname := @param_opnames[$opname_index];
-
-                    # what will be put in the value register
-                    my $val;
-
-                    if $var.slurpy {
-                        if $var.named {
-                            $opname := "param_sn";
-                        }
-                        else {
-                            $opname := "param_sp";
-                        }
-                    }
-                    elsif $var.named {
-                        $val := MAST::SVal.new( :value($var.named) );
-                    }
-                    else { # positional
-                        $val := MAST::IVal.new( :size(16), :value($param_index));
-                    }
-
-                    # the variable register
-                    my $valreg := $scope eq 'lexical'
-                        ?? $block.lexical_param($var.name)
-                        !! $block.local($var.name);
-
-                    # NQP->QAST always provides a default value for optional NQP params
-                    # even if no default initializer expression is provided.
-                    if $var.default {
-                        # generate end label to skip initialization code
-                        my $endlbl := MAST::Label.new( :name(self.unique('param') ~ '_end') );
-
-                        # generate default initialization code. Could also be
-                        # wrapped in another QAST::Block.
-                        my $default_mast := self.as_mast($var.default, :want($param_kind));
-
-                    #    nqp::die("default initialization result type doesn't match the param type")
-                    #        unless $default_mast.result_kind == $param_kind;
-
-                        # emit param grabbing op
-                        push_op(@pre, $opname, $valreg, $val, $endlbl);
-
-                        # emit default initialization code
-                        push_ilist(@pre, $default_mast);
-
-                        # put the initialization result in the variable register
-                        push_op(@pre, 'set', $valreg, $default_mast.result_reg);
-                        $*REGALLOC.release_register($default_mast.result_reg, $default_mast.result_kind);
-
-                        # end label to skip initialization code
-                        nqp::push(@pre, $endlbl);
-                    }
-                    elsif $var.slurpy {
-                        if $var.named {
-                            push_op(@pre, $opname, $valreg);
-                        }
-                        else {
-                            push_op(@pre, $opname, $valreg, MAST::IVal.new( :value($pos_required + $pos_optional) ));
-                        }
-                    }
-                    else {
-                        # emit param grabbing op
-                        push_op(@pre, $opname, $valreg, $val);
-                    }
-
-                    if $scope eq 'lexical' {
-                        # emit the op to bind the lexical to the result register
-                        push_op(@pre, 'bindlex', $block.lexical($var.name), $valreg);
-                    }
-                    $param_index++;
-                }
+                nqp::splice($frame.instructions, @pre, 0, 0);
             }
-
-            nqp::splice($frame.instructions, @pre, 0, 0);
         }
 
         if $node.blocktype eq 'raw' || !nqp::istype($outer, BlockInfo) {
@@ -865,7 +889,8 @@ class QAST::MASTCompiler {
             $result := self.compile_all_the_stmts(@($node), $resultchild);
         }
         for %stmt_temps -> $temp_key {
-            if !nqp::existskey(%*STMTTEMPS, $temp_key) {
+            if !nqp::existskey(%*STMTTEMPS, $temp_key) &&
+                    !nqp::eqaddr($*BLOCK.local($temp_key), $result.result_reg) {
                 $*BLOCK.release_temp($temp_key);
             }
         }
@@ -882,21 +907,23 @@ class QAST::MASTCompiler {
         my $result_count := 0;
         $resultchild := $resultchild // -1;
         my $final_stmt_idx := +@stmts - 1;
+        my $WANT := $*WANT;
+        my $all_void := nqp::defined($WANT) && $WANT == $MVM_reg_void;
         for @stmts {
             my $use_result := 0;
             # Compile this child to MAST, and add its instructions to the end
             # of our instruction list. Also track the last statement.
             # if this is the statement we've been asked to make the result
-            if $result_count == $resultchild
+            if !$all_void && ($result_count == $resultchild
             # or if we weren't given a particular result statement and we're on
             # the last statement,
-                    || $resultchild == -1 && $result_count == $final_stmt_idx {
+                    || $resultchild == -1 && $result_count == $final_stmt_idx) {
                 # compile $_ with an explicit $want, either what's given or obj
                 $last_stmt := self.as_mast($_, :want($want // $MVM_reg_obj));
                 $use_result := 1;
             }
             else {
-                $last_stmt := self.as_mast($_);
+                $last_stmt := self.as_mast($_, :want($MVM_reg_void));
             }
 
             # Annotate with line number if we have one.
@@ -1086,7 +1113,11 @@ class QAST::MASTCompiler {
             my $outer := 0;
             my $block := $*BLOCK;
             # find the block where the lexical was declared, if any
-            while !($lex := $block.lexical($name)) && ($block := $block.outer) ~~ BlockInfo {
+            while nqp::istype($block, BlockInfo) {
+                last if $block.qast<DYN_COMP_WRAPPER>;
+                $lex := $block.lexical($name);
+                last if $lex;
+                $block := $block.outer;
                 $outer++;
             }
             if $lex {
@@ -1120,17 +1151,15 @@ class QAST::MASTCompiler {
                 }
             }
             else {
+                $res_kind := self.type_to_register_kind($node.returns);
                 if $*BINDVAL {
-                    my $valmast := $node.returns
-                        ?? self.as_mast_clear_bindval($*BINDVAL, :want(self.type_to_register_kind($node.returns)))
-                        !! self.as_mast_clear_bindval($*BINDVAL);
+                    my $valmast := self.as_mast_clear_bindval($*BINDVAL, :want($res_kind));
                     $res_reg := $valmast.result_reg;
                     push_ilist(@ins, $valmast);
                     push_op(@ins, "bind"~@lex_n_opnames[@kind_to_op_slot[$res_kind]], MAST::SVal.new( :value($name) ), $res_reg);
                     $res_kind := $valmast.result_kind;
                 }
                 else {
-                    $res_kind := $node.returns ?? self.type_to_register_kind($node.returns) !!  $MVM_reg_obj;
                     $res_reg := $*REGALLOC.fresh_register($res_kind);
                     push_op(@ins, "get"~@lex_n_opnames[@kind_to_op_slot[$res_kind]],
                         $res_reg, MAST::SVal.new( :value($name) ));

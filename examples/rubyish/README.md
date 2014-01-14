@@ -20,8 +20,9 @@ Implemented:
 - nqp opcode calls: `nqp::sleep(5)`
 - a few built-ins: `abort`, `print`, `puts`, `sleep`
 - a couple of methods: `.call` and `.nil?`
-- infixish assigments: `+=` `-=` `*=` ...
-- very simple classes and objects with attributes. no inheritence
+- infixish assignments: `+=` `-=` `*=` ...
+- simple classes and objects with attributes.
+- method inheritance (no mixins yet) - see [inheritance.t](t/inheritance.t)
 - `while` and `until` loops
 - statement modifiers `if` `unless`, `while`, `until` e.g.: `puts 42 if true`
 - basic arrays and hashes
@@ -31,6 +32,8 @@ Implemented:
 - lightweight eRuby like templating, see [template.rbi](examples-rubyish/template.rbi)
 - heredocs, literal `<<EOF ... EOF` and interpolating `<<"END" ... END`
 - code block arguments `even = grep(arr) {|n| n % 2 == 0}` -- see [functional.t](t/functional.t)
+- package constants `Trig::PI = 3.1415926` (no inheritance yet)
+- ruby 2.x named parameters: def foo(bar:42, baz:) ; bar ^ baz; end
 
 Notes:
 ------
@@ -51,7 +54,7 @@ Strings and truth values are Perlish rather than Rubyish:
 - `+` always does addition (doesn't concatenate strings)
 - `~` has been introduced as the concatenation operator
 - `>`, `==`, `<=` ... only do arithmetic comparisons
-- `gt`, `eq`, `le` ... do string comparisions
+- `gt`, `eq`, `le` ... do string comparisons
 - 0, '0', '' are false in a boolean context.
 - hash dereferencing is via angle braces: `puts fruit<apples>` or
 curlies `puts fruit{'bananas'}`
@@ -76,13 +79,15 @@ this includes nqp control-flow functions:
     end
 ```
 
-There's some context sensitive parsing to distinguish functions and
-expressions, E.g.
+Rubyish does a limited amout of context sensitive parsing, E.g.
 ```
    yy = 37
    puts yy -5   # parsed as an expression; output is 32
 
    def xx(n) ; 37 - n; end
-   puts xx -5   # parsed as a method call; output is 42
+   puts xx -5   # parsed as a function call; output is 42
 ```
 
+This only works only if the functions and methods have been previously declared.
+
+If in doubt, use parenthesis for function calls, `capitalize(name)` vs `capitalize name`; and make method calls explicit, `self.fibonacci(n - 1)` vs `fibonacci(n - 1)`.
