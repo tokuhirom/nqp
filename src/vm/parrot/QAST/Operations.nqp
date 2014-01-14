@@ -548,6 +548,19 @@ QAST::Operations.add_core_op('ifnull', :inlinable(1), -> $qastcomp, $op {
     $ops
 });
 
+# Control exception throwing.
+my %control_map := nqp::hash(
+    'next', '.CONTROL_LOOP_NEXT',
+    'last', '.CONTROL_LOOP_LAST',
+    'redo', '.CONTROL_LOOP_REDO',
+    'next_label', 512,
+    'redo_label', 513,
+    'last_label', 514
+);
+
+my $loop_exception_handler := '[.CONTROL_LOOP_NEXT;.CONTROL_LOOP_REDO;.CONTROL_LOOP_LAST]';
+my $labeled_loop_exception_handler := '[.CONTROL_LOOP_NEXT;.CONTROL_LOOP_REDO;.CONTROL_LOOP_LAST;512;513;514]';
+
 # Loops.
 for ('', 'repeat_') -> $repness {
     for <while until> -> $op_name {
@@ -597,8 +610,8 @@ for ('', 'repeat_') -> $repness {
             if $handler {
                 $exc_reg := $*REGALLOC.fresh_p();
                 $ops.push_pirop('new', $exc_reg, "'ExceptionHandler'",
-                    $label  ?? '[.CONTROL_LOOP_NEXT;.CONTROL_LOOP_REDO;.CONTROL_LOOP_LAST;512;513;514]'
-                            !! '[.CONTROL_LOOP_NEXT;.CONTROL_LOOP_REDO;.CONTROL_LOOP_LAST]'
+                    $label  ?? $labeled_loop_exception_handler
+                            !! $loop_exception_handler
                 );
                 $ops.push_pirop('set_label', $exc_reg, $hand_lbl);
                 $ops.push_pirop('push_eh', $exc_reg);
@@ -668,9 +681,9 @@ for ('', 'repeat_') -> $repness {
                     $ops.push_pirop('get_id', $id1_reg, $pay_reg);
                     $ops.push_pirop('get_id', $id2_reg, $l);
                     $ops.push_pirop('ne', $id1_reg, $id2_reg, $rethrow_lbl);
-                    $ops.push_pirop('eq', $type_reg, 512, $operands == 3 ?? $next_lbl !! $test_lbl);
-                    $ops.push_pirop('eq', $type_reg, 513, $redo_lbl);
-                    $ops.push_pirop('eq', $type_reg, 514, $done_lbl);
+                    $ops.push_pirop('eq', $type_reg, %control_map<next_label>, $operands == 3 ?? $next_lbl !! $test_lbl);
+                    $ops.push_pirop('eq', $type_reg, %control_map<redo_label>, $redo_lbl);
+                    $ops.push_pirop('eq', $type_reg, %control_map<last_label>, $done_lbl);
                     $ops.push($rethrow_lbl);
                     $ops.push_pirop('rethrow', $exc_reg);
                 }
@@ -730,8 +743,8 @@ QAST::Operations.add_core_op('for', :inlinable(1), -> $qastcomp, $op {
         $exc_reg  := $*REGALLOC.fresh_p();
         $hand_lbl := PIRT::Label.new(:name('for_handlers'));
         $ops.push_pirop('new', $exc_reg, "'ExceptionHandler'",
-            $label  ?? '[.CONTROL_LOOP_NEXT;.CONTROL_LOOP_REDO;.CONTROL_LOOP_LAST;512;513;514]'
-                    !! '[.CONTROL_LOOP_NEXT;.CONTROL_LOOP_REDO;.CONTROL_LOOP_LAST]'
+            $label  ?? $labeled_loop_exception_handler
+                    !! $loop_exception_handler
         );
         $ops.push_pirop('set_label', $exc_reg, $hand_lbl);
         $ops.push_pirop('push_eh', $exc_reg);
@@ -783,9 +796,9 @@ QAST::Operations.add_core_op('for', :inlinable(1), -> $qastcomp, $op {
             $ops.push_pirop('get_id', $id1_reg, $pay_reg);
             $ops.push_pirop('get_id', $id2_reg, $l);
             $ops.push_pirop('ne', $id1_reg, $id2_reg, $rethrow_lbl);
-            $ops.push_pirop('eq', $type_reg, 512, $lbl_next);
-            $ops.push_pirop('eq', $type_reg, 513, $lbl_redo);
-            $ops.push_pirop('eq', $type_reg, 514, $lbl_done);
+            $ops.push_pirop('eq', $type_reg, %control_map<next_label>, $lbl_next);
+            $ops.push_pirop('eq', $type_reg, %control_map<redo_label>, $lbl_redo);
+            $ops.push_pirop('eq', $type_reg, %control_map<last_label>, $lbl_done);
             $ops.push($rethrow_lbl);
             $ops.push_pirop('rethrow', $exc_reg);
         }
@@ -1536,12 +1549,6 @@ QAST::Operations.add_core_op('resume', -> $qastcomp, $op {
         )))
 });
 
-# Control exception throwing.
-my %control_map := nqp::hash(
-    'next', '.CONTROL_LOOP_NEXT',
-    'last', '.CONTROL_LOOP_LAST',
-    'redo', '.CONTROL_LOOP_REDO'
-);
 QAST::Operations.add_core_op('control', -> $qastcomp, $op {
     my $name := $op.name;
     if nqp::existskey(%control_map, $name) {
@@ -1553,13 +1560,14 @@ QAST::Operations.add_core_op('control', -> $qastcomp, $op {
         my $ops := PIRT::Ops.new(:result('0'));
         
         if $label {
+            unless %control_map{$name ~ '_label'} {
+                nqp::die("Unexpencted control name '$name', must be 'next', 'redo' or 'last'");
+            }
             my $l  := $qastcomp.coerce($qastcomp.as_post($label), 'P');
             my $ex := $*REGALLOC.fresh_p();
             $ops.push($l);
             $ops.push_pirop('new', $ex, "'Exception'");
-            $ops.push_pirop('set', "$ex\['type']", 512) if $name eq 'next';
-            $ops.push_pirop('set', "$ex\['type']", 513) if $name eq 'redo';
-            $ops.push_pirop('set', "$ex\['type']", 514) if $name eq 'last';
+            $ops.push_pirop('set', "$ex\['type']", %control_map{$name ~ '_label'});
             $ops.push_pirop('set', "$ex\['payload']", $l);
             $ops.push_pirop('throw', $ex);
         }
